@@ -47,7 +47,7 @@ metadata:
     packages: []
   demo_data:
     - path: examples/demo_genes.json
-      description: STM815 degradation-benchmark gene set (nifH/nodC lost at 70%)
+      description: STM815 frag70 gene set (nod cluster undetectable; nifH survives on a 2nd copy)
   endpoints:
     cli: python skills/completeness-aware-caller/completeness_aware_caller.py --busco-json {busco_result} --genes {genes_json} --output {output_dir}
   openclaw:
@@ -120,9 +120,13 @@ assemble genomes. It consumes those results and gates the conclusions.
    1 − completeness; 0.95 caps that at 5%. Anchored to MIMAG quality tiers
    (Bowers et al. 2017) where "high-quality draft" starts at >90%.
 2. **ANI drift model**: drift = 0.82 × (1 − completeness) ANI points,
-   calibrated on the *P. phymatum* STM815 degradation benchmark bundled with
-   this skill's provenance (0.41 points of observed drift at 50% retention
-   against both *P. xenovorans* LB400 and *B. cenocepacia* J2315).
+   calibrated on the *P. phymatum* STM815 degradation benchmark (0.41 points
+   of observed drift at 50% retention against *P. xenovorans* LB400, 0.44
+   against *B. cenocepacia* J2315). This coefficient is CALIBRATED on that
+   benchmark, not validated against it: the same four points produced the
+   number and would be used to check it. In that benchmark the reference
+   ranking never actually failed — the margin widens under degradation — so
+   the gate bounds noise rather than catching a demonstrated error.
 3. **Safety factor 2**: a ranking margin must exceed 2× modelled drift —
    signal must beat twice the noise.
 4. **Species-boundary zone 94–96%** (Jain et al. 2018): ANI values in this
@@ -190,9 +194,10 @@ naive call for nifH would have been a false "absent".)
    the target clade and measure) or say the default is a Burkholderiaceae
    calibration.
 3. **BUSCO C% is itself noisy at high retention.** In the calibration
-   benchmark, dropping 9.7% of bases produced M=19.8% (marker loss is
-   clustered, not uniform). Treat completeness as an estimate with variance,
-   which is exactly why the thresholds are conservative.
+   benchmark, dropping 9.8% of bases produced M=19.8% at frag90 — but at
+   frag70 and frag50 base loss and marker loss track closely. Marker loss is
+   noisy at low loss rather than clustered throughout. Treat completeness as
+   an estimate with variance, which is why the thresholds are conservative.
 4. **`present` is not contamination-safe.** Detection confidence 1.0 assumes
    the contig truly belongs to the genome. For MAGs with high contamination,
    check CheckM contamination before trusting `present` calls.

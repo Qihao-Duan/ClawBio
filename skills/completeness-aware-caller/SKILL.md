@@ -198,7 +198,15 @@ naive call for nifH would have been a false "absent".)
    frag70 and frag50 base loss and marker loss track closely. Marker loss is
    noisy at low loss rather than clustered throughout. Treat completeness as
    an estimate with variance, which is why the thresholds are conservative.
-4. **`present` is not contamination-safe.** Detection confidence 1.0 assumes
+4. **The model will want to treat 1 − completeness as a real miss
+   probability. It is not.** That figure assumes genes are lost
+   independently. In the calibration benchmark they are not: every gene that
+   vanished at 70% retention sat in a single 50 kb window, so a co-located
+   operon disappears as a block. For a clustered gene set the true miss risk
+   is higher than 1 − C; for a dispersed set it is lower. Report the number
+   as a modelled bound, never as a measured rate.
+
+5. **`present` is not contamination-safe.** Detection confidence 1.0 assumes
    the contig truly belongs to the genome. For MAGs with high contamination,
    check CheckM contamination before trusting `present` calls.
 

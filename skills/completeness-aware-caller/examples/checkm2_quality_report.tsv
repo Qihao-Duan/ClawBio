@@ -1,0 +1,5 @@
+Name	Completeness	Contamination	Completeness_Model_Used	Translation_Table_Used	Coding_Density	Contig_N50	Average_Gene_Length	Genome_Size	GC_Content	Total_Coding_Sequences	Total_Contigs	Max_Contig_Length	Additional_Notes
+stm815_frag100	100.0	1.0	Neural Network (Specific Model)	11	0.853	50000	311.5620272314675	8676562	0.62	7932	175	50000	None
+stm815_frag50	54.66	0.19	Neural Network (Specific Model)	11	0.856	50000	312.2241637543684	4376561	0.62	4006	88	50000	None
+stm815_frag70	74.3	0.18	Neural Network (Specific Model)	11	0.855	50000	312.56992371957864	6031454	0.62	5506	122	50000	None
+stm815_frag90	87.41	0.82	Neural Network (Specific Model)	11	0.853	50000	310.87651737128505	7826562	0.62	7167	158	50000	None

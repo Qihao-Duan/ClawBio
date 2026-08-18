@@ -27,6 +27,30 @@ metadata:
         --busco-json pointing at a busco-assessor result.json (required
         unless --demo)
       required: true
+    - name: checkm2_tsv
+      type: file
+      format:
+        - tsv
+      description: >-
+        CheckM2 quality_report.tsv; supplies completeness AND contamination
+        from one run. Mutually exclusive with --busco-json. Use --genome to
+        pick a row when the report covers several genomes.
+      required: false
+    - name: genome
+      type: value
+      format:
+        - string
+      description: >-
+        Row (Name column) to select when --checkm2-tsv covers several genomes
+      required: false
+    - name: contamination
+      type: value
+      format:
+        - float
+      description: >-
+        Contamination percent (0-100), overriding the CheckM2 value; gates
+        `present` calls against MIMAG tiers
+      required: false
     - name: genes
       type: file
       format:
@@ -45,15 +69,28 @@ metadata:
   dependencies:
     python: ">=3.10"
     packages: []
+    external:
+      - checkm2>=1.1.0 (optional; only for --checkm2-tsv, via scripts/install_checkm2.sh)
+      - CheckM2 UniRef100/KO database, 3.1 GB (Zenodo record 14897628; not a conda package)
   demo_data:
     - path: examples/demo_genes.json
       description: STM815 degradation-benchmark gene set (nifH/nodC lost at 70%)
+    - path: examples/checkm2_quality_report.tsv
+      description: >-
+        Real CheckM2 1.1.0 output for the four STM815 degradation levels
+        (completeness 100.00/87.41/74.30/54.66, contamination <1%)
   endpoints:
     cli: python skills/completeness-aware-caller/completeness_aware_caller.py --busco-json {busco_result} --genes {genes_json} --output {output_dir}
   openclaw:
     requires:
       bins:
         - python3
+    install:
+      - kind: conda
+        package: checkm2=1.1.0
+        channels:
+          - bioconda
+          - conda-forge
     always: false
     emoji: "🚦"
     homepage: https://github.com/ClawBio/ClawBio
@@ -90,6 +127,8 @@ functionally identical; this skill's deliverable is the refusal — an explicit
 
 **Do NOT fire when:**
 - User wants to *measure* completeness → route to `busco-assessor`
+  (eukaryotes, or marker-based) or CheckM2 via `scripts/run_checkm2.sh`
+  (prokaryotic genomes and MAGs, and the only source of contamination)
 - User wants to *compute* ANI or relatedness → run FastANI (or
   `galaxy-bridge`), then come back here with the values
 - User wants variant-level interpretation → `clinical-variant-reporter`
@@ -119,10 +158,24 @@ assemble genomes. It consumes those results and gates the conclusions.
    0.95`). Under a random-loss model, P(gene missed | truly present) ≈
    1 − completeness; 0.95 caps that at 5%. Anchored to MIMAG quality tiers
    (Bowers et al. 2017) where "high-quality draft" starts at >90%.
-2. **ANI drift model**: drift = 0.82 × (1 − completeness) ANI points,
+2. **ANI drift model**: drift = k × (1 − completeness) ANI points,
    calibrated on the *P. phymatum* STM815 degradation benchmark bundled with
    this skill's provenance (0.41 points of observed drift at 50% retention
    against both *P. xenovorans* LB400 and *B. cenocepacia* J2315).
+   **k depends on which tool measured completeness**, because BUSCO and
+   CheckM2 do not report the same number for the same assembly:
+   `DRIFT_COEFF = 0.82` for BUSCO C%, `DRIFT_COEFF_CHECKM2 = 0.98` for
+   CheckM2 Completeness (0.88 against ground-truth base retention, for
+   reference). Fitted by least squares through the origin on four retention
+   levels × two references; derivation and raw tool output at
+   https://github.com/Qihao-Duan/completeness-aware-caller
+   (`benchmark/benchmark_summary.md`, `benchmark/checkm2/`).
+5. **Contamination gates presence, not absence** (MIMAG tiers, Bowers et al.
+   2017): <5% → `present` unchanged; 5–10% → `present` with confidence
+   reduced to 1 − contamination; ≥10% → `cannot_conclude`, because a detected
+   contig can no longer be attributed to this genome rather than the
+   contaminating one. Contamination adds sequence, so it never affects an
+   absence call.
 3. **Safety factor 2**: a ranking margin must exceed 2× modelled drift —
    signal must beat twice the noise.
 4. **Species-boundary zone 94–96%** (Jain et al. 2018): ANI values in this
@@ -130,20 +183,39 @@ assemble genomes. It consumes those results and gates the conclusions.
 
 ## Workflow
 
-1. Parse completeness from `--completeness` (fraction or percent) or from a
-   `busco-assessor` `result.json` via `--busco-json` (field `C`). Reject
-   values outside (0, 1] / (1, 100].
-2. For each gene in `--genes`: found → `present`; not found and
-   completeness ≥ 0.95 → `absent` with confidence = completeness; otherwise
-   → `cannot_conclude` with the miss probability spelled out.
-3. If `--ani-a`/`--ani-b` supplied: compute margin, modelled drift, and
-   decide `rank` vs `cannot_conclude`; flag the species-boundary zone.
+1. Parse completeness from `--completeness` (fraction or percent), from a
+   `busco-assessor` `result.json` via `--busco-json` (field `C`), or from a
+   CheckM2 `quality_report.tsv` via `--checkm2-tsv` (columns `Completeness`
+   and `Contamination`; `--genome` selects a row in a multi-genome report).
+   Reject values outside (0, 1] / (1, 100]. Record which tool supplied the
+   number — it selects the drift coefficient in step 3.
+2. For each gene in `--genes`: found → `present`, subject to the
+   contamination gate (≥10% contamination downgrades it to
+   `cannot_conclude`); not found and completeness ≥ 0.95 → `absent` with
+   confidence = completeness; otherwise → `cannot_conclude` with the miss
+   probability spelled out.
+3. If `--ani-a`/`--ani-b` supplied: compute margin and modelled drift using
+   the coefficient fitted for the completeness source from step 1, then
+   decide `rank` vs `cannot_conclude`; flag the species-boundary zone. A
+   hand-supplied `--completeness` has no calibration of its own, so the gate
+   falls back to the BUSCO coefficient and is marked `"calibration":
+   "assumed"` in `result.json`.
 4. Write `report.md` (call table + gate + disclaimer), `result.json`
    (calls, thresholds, decision), `commands.sh` (replay).
 
 ## CLI Reference
 
 ```bash
+# One-time: install CheckM2 and its 3.1 GB reference database
+sh skills/completeness-aware-caller/scripts/install_checkm2.sh
+
+# Score genomes, then gate the calls on completeness AND contamination
+sh skills/completeness-aware-caller/scripts/run_checkm2.sh \
+  --input ./bins --output /tmp/checkm2_out
+python skills/completeness-aware-caller/completeness_aware_caller.py \
+  --checkm2-tsv /tmp/checkm2_out/quality_report.tsv --genome bin_042 \
+  --genes genes.json --ani-a 81.45 --ani-b 80.75 --output /tmp/cac_out
+
 # From a busco-assessor run + gene search results + FastANI values
 python skills/completeness-aware-caller/completeness_aware_caller.py \
   --busco-json /path/to/busco_out/result.json \
@@ -193,9 +265,24 @@ naive call for nifH would have been a false "absent".)
    benchmark, dropping 9.7% of bases produced M=19.8% (marker loss is
    clustered, not uniform). Treat completeness as an estimate with variance,
    which is exactly why the thresholds are conservative.
-4. **`present` is not contamination-safe.** Detection confidence 1.0 assumes
-   the contig truly belongs to the genome. For MAGs with high contamination,
-   check CheckM contamination before trusting `present` calls.
+4. **`present` is only contamination-safe when contamination is supplied.**
+   Detection confidence 1.0 assumes the contig truly belongs to the genome.
+   `--checkm2-tsv` supplies contamination and the gate applies automatically;
+   the BUSCO path does not, because BUSCO does not measure contamination. If
+   you gate on BUSCO completeness, pass `--contamination` explicitly or treat
+   every `present` as ungated.
+5. **Never mix one tool's completeness with the other's drift coefficient.**
+   CheckM2 read 87.4% where BUSCO read 78.4% on the same assembly. Reusing
+   `DRIFT_COEFF` (0.82, BUSCO) with CheckM2 completeness understates the
+   threshold by ~16%, so the gate ranks when it should abstain — at frag50 it
+   would wrongly rank any margin in [0.741, 0.885). The skill selects the
+   coefficient from the input flag; do not override `drift_coeff` by hand
+   unless you have fitted your own.
+6. **CheckM2 runs optimistic on heavily fragmented assemblies.** Against
+   ground-truth base retention it read +4.8 and +4.2 points high at 70% and
+   50% retention. It is still the more accurate estimator overall (MAE 2.95
+   vs BUSCO's 4.26), but a completeness just over 95% from a fragmented bin
+   deserves scepticism before absence is asserted.
 
 ## Safety
 
@@ -222,6 +309,7 @@ naive call for nifH would have been a false "absent".)
 
 | Upstream | Handoff | Downstream |
 |----------|---------|-----------|
+| CheckM2 (`scripts/run_checkm2.sh`) | `quality_report.tsv` (completeness + contamination) | `completeness-aware-caller` |
 | `busco-assessor` | `result.json` (C%) | `completeness-aware-caller` |
 | FastANI / `galaxy-bridge` | ANI values | `completeness-aware-caller` |
 | `completeness-aware-caller` | `result.json` three-state calls | `profile-report`, `lit-synthesizer` |
@@ -244,3 +332,6 @@ naive call for nifH would have been a false "absent".)
   https://doi.org/10.1038/s41467-018-07641-9
 - Manni M. et al. (2021). BUSCO Update. *Molecular Biology and Evolution*.
   https://doi.org/10.1093/molbev/msab199
+- Chklovski A. et al. (2023). CheckM2: a rapid, scalable and accurate tool
+  for assessing microbial genome quality using machine learning. *Nature
+  Methods*. https://doi.org/10.1038/s41592-023-01940-w

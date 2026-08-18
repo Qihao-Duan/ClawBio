@@ -19,7 +19,14 @@ SCRIPT = SKILL_DIR / "completeness_aware_caller.py"
 
 sys.path.insert(0, str(SKILL_DIR))
 
-from completeness_aware_caller import ani_margin_gate, call_gene, parse_completeness
+from completeness_aware_caller import (
+    DRIFT_COEFF,
+    DRIFT_COEFF_CHECKM2,
+    ani_margin_gate,
+    call_gene,
+    parse_checkm2_report,
+    parse_completeness,
+)
 
 
 # ---------------------------------------------------------------- gene calls
@@ -128,3 +135,191 @@ def test_cli_with_real_inputs(tmp_path):
     statuses = {g["gene"]: g["status"] for g in data["gene_calls"]}
     assert statuses["nifH"] == "absent"
     assert statuses["nodC"] == "present"
+
+
+# ------------------------------------------------------- CheckM2 integration
+# CheckM2 supplies completeness AND contamination from one run, which is what
+# lets the skill gate `present` calls as well as `absent` ones.
+
+CHECKM2_HEADER = (
+    "Name\tCompleteness\tContamination\tCompleteness_Model_Used\t"
+    "Translation_Table_Used\n"
+)
+
+
+def _checkm2_tsv(tmp_path, rows, name="quality_report.tsv"):
+    """rows: [(genome, completeness, contamination), ...]"""
+    body = "".join(
+        f"{g}\t{c}\t{x}\tNeural Network (Specific Model)\t11\n"
+        for g, c, x in rows
+    )
+    path = tmp_path / name
+    path.write_text(CHECKM2_HEADER + body)
+    return path
+
+
+def test_checkm2_report_single_row_parsed(tmp_path):
+    tsv = _checkm2_tsv(tmp_path, [("bin1", 74.3, 0.18)])
+    got = parse_checkm2_report(tsv)
+    assert got["genome"] == "bin1"
+    assert got["completeness"] == pytest.approx(74.3)
+    assert got["contamination"] == pytest.approx(0.18)
+
+
+def test_checkm2_report_multi_row_requires_genome(tmp_path):
+    tsv = _checkm2_tsv(tmp_path, [("bin1", 74.3, 0.18), ("bin2", 90.0, 1.0)])
+    with pytest.raises(ValueError, match="pass --genome"):
+        parse_checkm2_report(tsv)
+
+
+def test_checkm2_report_selects_named_genome(tmp_path):
+    tsv = _checkm2_tsv(tmp_path, [("bin1", 74.3, 0.18), ("bin2", 90.0, 1.0)])
+    got = parse_checkm2_report(tsv, genome="bin2")
+    assert got["completeness"] == pytest.approx(90.0)
+
+
+def test_checkm2_report_unknown_genome_lists_available(tmp_path):
+    tsv = _checkm2_tsv(tmp_path, [("bin1", 74.3, 0.18)])
+    with pytest.raises(ValueError, match="bin1"):
+        parse_checkm2_report(tsv, genome="nope")
+
+
+def test_checkm2_report_rejects_non_checkm2_tsv(tmp_path):
+    path = tmp_path / "other.tsv"
+    path.write_text("a\tb\n1\t2\n")
+    with pytest.raises(ValueError, match="not a CheckM2"):
+        parse_checkm2_report(path)
+
+
+# --------------------------------------------------------- contamination gate
+def test_clean_bin_leaves_present_untouched():
+    """Below the MIMAG 5% bound, behaviour must match the pre-CheckM2 skill."""
+    assert call_gene(True, 0.9, contamination=1.0) == call_gene(True, 0.9)
+
+
+def test_absent_contamination_is_backwards_compatible():
+    """No contamination supplied => exactly the original behaviour."""
+    assert call_gene(True, 0.9, contamination=None)["confidence"] == 1.0
+
+
+def test_moderate_contamination_downweights_present():
+    result = call_gene(True, 0.99, contamination=7.0)
+    assert result["status"] == "present"
+    assert result["confidence"] == pytest.approx(0.93)
+
+
+def test_high_contamination_refuses_presence():
+    result = call_gene(True, 0.99, contamination=12.0)
+    assert result["status"] == "cannot_conclude"
+    assert "CANNOT CONCLUDE presence" in result["message"]
+
+
+def test_contamination_does_not_affect_absence():
+    """Contamination adds sequence; it cannot explain a missing gene."""
+    clean = call_gene(False, 0.99, contamination=0.1)
+    dirty = call_gene(False, 0.99, contamination=30.0)
+    assert clean["status"] == dirty["status"] == "absent"
+
+
+def test_contamination_boundaries_are_inclusive_below():
+    assert call_gene(True, 0.99, contamination=4.99)["confidence"] == 1.0
+    assert call_gene(True, 0.99, contamination=5.0)["status"] == "present"
+    assert call_gene(True, 0.99, contamination=9.99)["status"] == "present"
+    assert call_gene(True, 0.99, contamination=10.0)["status"] == "cannot_conclude"
+
+
+# ------------------------------------------------- estimator-aware drift model
+def test_drift_coefficient_differs_by_completeness_source():
+    """BUSCO and CheckM2 disagree on the same assembly, so each has its own
+    coefficient. Reusing one for the other silently mis-scales the gate."""
+    busco = ani_margin_gate(81.45, 80.75, 0.681, source="busco")
+    checkm2 = ani_margin_gate(81.45, 80.75, 0.743, source="checkm2")
+    assert busco["drift_coeff"] == DRIFT_COEFF
+    assert checkm2["drift_coeff"] == DRIFT_COEFF_CHECKM2
+    assert checkm2["drift_coeff"] > busco["drift_coeff"]
+
+
+def test_manual_completeness_is_marked_uncalibrated():
+    gate = ani_margin_gate(81.45, 80.75, 0.70, source="manual")
+    assert gate["calibration"] == "assumed"
+    assert gate["drift_coeff"] == DRIFT_COEFF
+
+
+def test_known_sources_are_marked_fitted():
+    for src in ("busco", "checkm2"):
+        assert ani_margin_gate(81.45, 80.75, 0.70, source=src)["calibration"] == "fitted"
+
+
+def test_explicit_drift_coeff_overrides_source():
+    gate = ani_margin_gate(81.45, 80.75, 0.70, source="checkm2", drift_coeff=0.5)
+    assert gate["drift_coeff"] == 0.5
+
+
+# ------------------------------------------------------------------- CLI paths
+def test_cli_rejects_both_completeness_sources(tmp_path):
+    tsv = _checkm2_tsv(tmp_path, [("bin1", 74.3, 0.18)])
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--checkm2-tsv", str(tsv),
+         "--busco-json", "whatever.json", "--output", str(tmp_path / "o")],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode != 0
+    assert "not both" in (proc.stdout + proc.stderr)
+
+
+def test_cli_checkm2_end_to_end(tmp_path):
+    tsv = _checkm2_tsv(tmp_path, [("bin1", 74.3, 0.18)])
+    genes = tmp_path / "genes.json"
+    genes.write_text(json.dumps([
+        {"gene": "nodC", "found": False},
+        {"gene": "nifH", "found": True},
+    ]))
+    out = tmp_path / "cm2_out"
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--checkm2-tsv", str(tsv),
+         "--genes", str(genes), "--output", str(out)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads((out / "result.json").read_text())
+    assert data["completeness_source"] == "checkm2"
+    assert data["contamination"] == pytest.approx(0.18)
+    assert data["genome"] == "bin1"
+    statuses = {g["gene"]: g["status"] for g in data["gene_calls"]}
+    assert statuses["nodC"] == "cannot_conclude"
+    assert statuses["nifH"] == "present"
+    assert "Contamination" in (out / "report.md").read_text()
+
+
+def test_cli_high_contamination_flips_present_to_refusal(tmp_path):
+    tsv = _checkm2_tsv(tmp_path, [("dirty", 99.0, 12.0)])
+    genes = tmp_path / "genes.json"
+    genes.write_text(json.dumps([{"gene": "nifH", "found": True}]))
+    out = tmp_path / "dirty_out"
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--checkm2-tsv", str(tsv),
+         "--genes", str(genes), "--output", str(out)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads((out / "result.json").read_text())
+    assert data["gene_calls"][0]["status"] == "cannot_conclude"
+
+
+def test_cli_missing_file_is_a_message_not_a_traceback(tmp_path):
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--checkm2-tsv", str(tmp_path / "nope.tsv"),
+         "--output", str(tmp_path / "o")],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode != 0
+    combined = proc.stdout + proc.stderr
+    assert "Traceback" not in combined
+    assert "error:" in combined
+
+
+def test_shipped_checkm2_example_is_readable():
+    """The CheckM2 evidence shipped in examples/ must stay parseable."""
+    tsv = SKILL_DIR / "examples" / "checkm2_quality_report.tsv"
+    got = parse_checkm2_report(tsv, genome="stm815_frag70")
+    assert got["completeness"] == pytest.approx(74.3, abs=0.1)

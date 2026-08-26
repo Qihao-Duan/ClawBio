@@ -111,7 +111,10 @@ functionally identical; this skill's deliverable is the refusal — an explicit
 
 One skill, one task: **decide whether completeness supports a claim**. This
 skill does not measure completeness, compute ANI, search for genes, or
-assemble genomes. It consumes those results and gates the conclusions.
+assemble genomes — and it does not assess contamination: a `present` call
+assumes the contig truly belongs to the genome (Gotcha 5), so run CheckM
+upstream when that is in doubt. It consumes those results and gates the
+conclusions.
 
 ## Domain Decisions
 
